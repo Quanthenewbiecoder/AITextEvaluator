@@ -1,0 +1,123 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.eggs/
+.build/
+dist/
+htmlcov/
+.coverage
+*.cover
+.cache/
+.mypy_cache/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# --- Environments ---
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# --- OS / editors ---
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# --- Project outputs (keep repo slim) ---
+# datasets & exports
+collectors/*.csv
+collectors/*.tsv
+collectors/*.json
+data/
+datasets/
+outputs/
+export/
+*.csv
+*.tsv
+*.jsonl
+*.parquet
+*.xz
+*.zip
+*.gz
+
+# models & artifacts
+*.joblib
+*.pkl
+*.pt
+*.onnx
+models/
+checkpoints/
+
+# logs & tmp
+logs/
+*.log
+tmp/
+temp/
+*.tmp
+
+# --- Optional: keep tiny demo data tracked ---
+# !examples/tiny_sample.csv
+
+# --- Notebooks / experiments ---
+*.ipynb_checkpoints/
+*.ipynb~ 
+experiments/
+notebooks/.ipynb_checkpoints/
+
+# --- Configuration & local secrets ---
+config.yaml
+config.yml
+*.ini
+*.toml
+*.cfg
+secrets.yaml
+keys.json
+token.json
+
+# --- Cache / profiling / compiled junk ---
+*.prof
+*.out
+*.bak
+*.orig
+*.rej
+*.sqlite3
+*.db
+*.db-journal
+
+# --- Linting / tooling ---
+.tox/
+coverage.xml
+.pyre/
+.pytype/
+ruff_cache/
+.pre-commit-config.yaml
+.pre-commit-hooks.yaml
+
+# --- VSCode / JetBrains extras ---
+.vscode/*
+!.vscode/settings.json   # optional if you want to keep workspace config
+.idea/**/workspace.xml
+.idea/**/tasks.xml
+.idea/**/dictionaries
+.idea/**/shelf/
+
+# --- Jupyter runtime ---
+.jupyter/
+.ipython/
+
+# --- Optional: keep tiny demo data tracked ---
+# Keep one small demo dataset for reproducibility
+!data.csv
+!data_huge.csv
+!data_large.csv
+
+collect_academic_humans.py
+make_synthetic_academic_ai_like.py
