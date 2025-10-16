@@ -1,40 +1,51 @@
 # anti_ai_toolkit.py
-# Heuristic AI-content detector + Supervised & Unsupervised pipelines (+ tips & light rewrite)
+# Heuristic AI-content detector + Supervised & Unsupervised pipelines (+ TF-IDF, Embeddings, Blending, Grouped CV)
 # Large-dataset friendly: subsampled OCSVM/LOF, parallel IF/LOF, optional float32 downcast
 # ---------------------------------------------------------------------------
 # Install (for training):
 #   pip install scikit-learn joblib numpy
+# Optional (for embeddings):
+#   pip install sentence-transformers
 #
-# Supervised:
-#   python anti_ai_toolkit.py --train data1.csv data2.csv --dedupe --cv 5
-#   python anti_ai_toolkit.py --train data.csv --test-size 0.2
-#   python anti_ai_toolkit.py --train data.csv --no-holdout
+# Supervised (with TF-IDF + blend + grouped CV):
+#   python anti_ai_toolkit.py --train human1.csv human2.csv ai.csv --dedupe --approx-dedupe --cv 5 --cv-grouped --blend
+#   python anti_ai_toolkit.py --train ... --no-tfidf                # to disable tf-idf model
+#   python anti_ai_toolkit.py --train ... --use-embeddings          # to add embeddings to blend
 #   python anti_ai_toolkit.py --use-model anti_ai_model.joblib --check "text..." --rewrite
-#   python anti_ai_toolkit.py --use-model anti_ai_model.joblib --check-file path.txt
 #
 # Unsupervised (train on human-only rows: label=0):
-#   python anti_ai_toolkit.py --unsup-train-humans data.csv --unsup-model anti_ai_unsup.joblib \
+#   python anti_ai_toolkit.py --unsup-train-humans human1.csv human2.csv \
 #       --unsup-model-type ensemble --unsup-outlier-frac 0.1 --unsup-thr 90
-#   python anti_ai_toolkit.py --unsup-model anti_ai_unsup.joblib --unsup-check "text..."
 #
 # Notes:
-#   - Heuristic scoring requires no external dependencies.
-#   - Supervised/Unsupervised training requires: scikit-learn, joblib, numpy
+#   - Supervised saves either a single feature model OR a blended pack with tf-idf/embeddings and weights.
+#   - Predict will auto-detect and use the blended pack if present.
 
-import re, math, csv, argparse, statistics, os, sys, random, hashlib
-from typing import List, Dict, Any, Tuple
+import re, math, csv, argparse, statistics, os, sys, random, hashlib, warnings
+from typing import List, Dict, Any, Tuple, Optional
 from collections import Counter
 
 import joblib
 import numpy as np
 from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import train_test_split, StratifiedKFold
-from sklearn.metrics import classification_report, roc_auc_score, accuracy_score
+from sklearn.model_selection import train_test_split, StratifiedKFold, GroupKFold
+from sklearn.metrics import classification_report, roc_auc_score, accuracy_score, precision_recall_curve, f1_score, precision_score, recall_score
 
-from sklearn.svm import OneClassSVM
+from sklearn.svm import OneClassSVM, LinearSVC
 from sklearn.ensemble import IsolationForest
 from sklearn.neighbors import LocalOutlierFactor
 from sklearn.covariance import EmpiricalCovariance
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.pipeline import make_pipeline
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.base import BaseEstimator
+
+# Optional embeddings
+try:
+    from sentence_transformers import SentenceTransformer
+    _HAS_ST = True
+except Exception:
+    _HAS_ST = False
 
 MODEL_DEFAULT_PATH = "anti_ai_model.joblib"
 UNSUP_DEFAULT_PATH = "anti_ai_unsup.joblib"
@@ -194,15 +205,15 @@ def score_features(text: str) -> Dict[str, Any]:
 
     # Interpretable 0–100 heuristic — tune as needed
     score = 0.0
-    score += 20.0 * max(0.0, (12.0 - min(12.0, feats["burstiness_std"])) / 12.0)   # uniform rhythm
-    score += 18.0 * min(1.0, feats["connector_ratio"] * 10)                         # connectors
-    score += 12.0 * max(0.0, (feats["function_word_ratio"] - 0.45) / 0.25)          # function words
-    score += 12.0 * max(0.0, (0.45 - feats["type_token_ratio"]) / 0.45)             # low lexical variety
-    score += 12.0 * min(1.0, feats.get("repeat_bigram_ratio",0.0)*5)                # repetition
+    score += 20.0 * max(0.0, (12.0 - min(12.0, feats["burstiness_std"])) / 12.0)
+    score += 18.0 * min(1.0, feats["connector_ratio"] * 10)
+    score += 12.0 * max(0.0, (feats["function_word_ratio"] - 0.45) / 0.25)
+    score += 12.0 * max(0.0, (0.45 - feats["type_token_ratio"]) / 0.45)
+    score += 12.0 * min(1.0, feats.get("repeat_bigram_ratio",0.0)*5)
     score += 4.0  * min(1.0, feats.get("repeat_trigram_ratio",0.0)*5)
     score += 6.0  * min(1.0, feats.get("repeat_shingle8_ratio",0.0)*5)
-    if feats["zero_width_count"] > 0: score += 6.0                                   # hidden marks
-    score += 8.0 * min(1.0, feats["homoglyph_ratio"] * 5)                            # homoglyphs
+    if feats["zero_width_count"] > 0: score += 6.0
+    score += 8.0 * min(1.0, feats["homoglyph_ratio"] * 5)
     ent = feats["char_entropy"]
     if ent < 3.5: score += 4.0 * (3.5 - ent)/3.5
     elif ent > 5.0: score += 4.0 * (ent - 5.0)/3.0
@@ -230,11 +241,10 @@ def shingle_hash(s: str, k: int = 8) -> str:
     return h
 
 def read_csvs(paths: List[str], dedupe: bool = True, approx_dedupe: bool = False):
-    texts, labels = [], []
-    seen = set()
-    seen_approx = set()
-    total_rows = 0
-    for p in paths:
+    texts, labels, total_rows, kept = [], [], 0, 0
+    seen = set(); seen_approx = set()
+    source_ids = []  # group index per row (for grouped CV / leave-one-source-out)
+    for src_id, p in enumerate(paths):
         with open(p, "r", encoding="utf-8") as f:
             r = csv.DictReader(f)
             if "text" not in r.fieldnames or "label" not in r.fieldnames:
@@ -251,7 +261,7 @@ def read_csvs(paths: List[str], dedupe: bool = True, approx_dedupe: bool = False
                     continue
                 if dedupe:
                     key = normalize_text(t)
-                    if key in seen:
+                    if key in seen:  # exact dedupe
                         continue
                     seen.add(key)
                 if approx_dedupe:
@@ -259,10 +269,11 @@ def read_csvs(paths: List[str], dedupe: bool = True, approx_dedupe: bool = False
                     if h in seen_approx:
                         continue
                     seen_approx.add(h)
-                texts.append(t); labels.append(lab)
-    return texts, labels, total_rows, len(texts)
+                texts.append(t); labels.append(lab); source_ids.append(src_id)
+                kept += 1
+    return texts, labels, total_rows, kept, source_ids
 
-# ---------------- Supervised Model ----------------
+# ---------------- Supervised Model (features) ----------------
 def _vec(feats: Dict[str,Any]) -> List[float]:
     return [float(feats.get(f, 0.0)) for f in FEATURE_ORDER]
 
@@ -270,113 +281,252 @@ def kfold_eval(X, y, k=5, seed=42):
     skf = StratifiedKFold(n_splits=k, shuffle=True, random_state=seed)
     accs, rocs = [], []
     for fold, (tr, te) in enumerate(skf.split(X, y), 1):
-        clf = LogisticRegression(
-            solver="lbfgs",
-            max_iter=5000,
-            C=0.5,
-            class_weight="balanced"
-        )
+        clf = LogisticRegression(solver="lbfgs", max_iter=5000, C=0.5, class_weight="balanced")
         Xtr = [X[i] for i in tr]; ytr = [y[i] for i in tr]
         Xte = [X[i] for i in te]; yte = [y[i] for i in te]
         clf.fit(Xtr, ytr)
-        yhat = clf.predict(Xte)
-        acc = accuracy_score(yte, yhat)
-        try:
-            yproba = clf.predict_proba(Xte)[:,1]
-            roc = roc_auc_score(yte, yproba)
-        except Exception:
-            roc = float('nan')
-        accs.append(acc); rocs.append(roc)
+        yproba = clf.predict_proba(Xte)[:,1]
+        yhat = (yproba >= 0.5).astype(int)
+        acc = accuracy_score(yte, yhat); roc = roc_auc_score(yte, yproba)
         print(f"Fold {fold}: acc={acc:.4f}  roc_auc={roc:.4f}")
-    print(f"{k}-fold mean acc={sum(accs)/k:.4f}, mean roc_auc={np.nanmean(rocs):.4f}")
+        accs.append(acc); rocs.append(roc)
+    print(f"{k}-fold mean acc={sum(accs)/k:.4f}, mean roc_auc={np.mean(rocs):.4f}")
     return accs, rocs
 
+def kfold_eval_grouped(X, y, groups, k=5):
+    gkf = GroupKFold(n_splits=min(k, len(set(groups))))
+    accs, rocs = [], []
+    for fold, (tr, te) in enumerate(gkf.split(X, y, groups=groups), 1):
+        clf = LogisticRegression(solver="lbfgs", max_iter=5000, C=0.5, class_weight="balanced")
+        Xtr = [X[i] for i in tr]; ytr = [y[i] for i in tr]
+        Xte = [X[i] for i in te]; yte = [y[i] for i in te]
+        clf.fit(Xtr, ytr)
+        yproba = clf.predict_proba(Xte)[:,1]
+        yhat = (yproba >= 0.5).astype(int)
+        acc = accuracy_score(yte, yhat); roc = roc_auc_score(yte, yproba)
+        print(f"[Grouped] Fold {fold}: acc={acc:.4f}  roc_auc={roc:.4f}")
+        accs.append(acc); rocs.append(roc)
+    print(f"[Grouped] mean acc={np.mean(accs):.4f}, mean roc_auc={np.mean(rocs):.4f}")
+    return accs, rocs
+
+# ---------------- TF-IDF & Embeddings ----------------
+def build_tfidf_model():
+    tfidf = TfidfVectorizer(analyzer="char_wb", ngram_range=(3,5), min_df=3, max_df=0.9, sublinear_tf=True)
+    base = LinearSVC(C=1.0, class_weight="balanced")
+    clf = CalibratedClassifierCV(base, method="isotonic", cv=3)
+    return make_pipeline(tfidf, clf)
+
+def embed_texts(texts: List[str], model_name: str):
+    if not _HAS_ST:
+        raise RuntimeError("sentence-transformers not installed. Run: pip install sentence-transformers")
+    st = SentenceTransformer(model_name)
+    return st.encode(texts, batch_size=64, convert_to_numpy=True, normalize_embeddings=True)
+
+def best_threshold(y_true, scores, metric="f1"):
+    ps, rs, ts = precision_recall_curve(y_true, scores)
+    best, best_thr = -1.0, 0.5
+    for t in ts:
+        yhat = (scores >= t).astype(int)
+        if metric == "f1":
+            m = f1_score(y_true, yhat)
+        elif metric == "precision":
+            m = precision_score(y_true, yhat, zero_division=0)
+        else:
+            m = recall_score(y_true, yhat)
+        if m > best:
+            best, best_thr = m, t
+    return float(best_thr), float(best)
+
+# ---------------- Train Supervised ----------------
 def train_from_csv(csv_paths: List[str], save_path: str = MODEL_DEFAULT_PATH,
                    test_size: float = 0.20, no_holdout: bool = False,
-                   dedupe: bool = True, approx_dedupe: bool = False, cv: int = 0, seed: int = 42):
-    texts, labels, total_rows, kept = read_csvs(csv_paths, dedupe=dedupe, approx_dedupe=approx_dedupe)
+                   dedupe: bool = True, approx_dedupe: bool = False, cv: int = 0,
+                   seed: int = 42, cv_grouped: bool = False,
+                   use_tfidf: bool = True, use_embeddings: bool = False,
+                   embed_model: str = "sentence-transformers/all-MiniLM-L6-v2",
+                   blend: bool = True, blend_weights: str = "feat=0.5,tfidf=0.5,emb=0.0",
+                   eval_leave_one: bool = False):
+    texts, labels, total_rows, kept, groups = read_csvs(csv_paths, dedupe=dedupe, approx_dedupe=approx_dedupe)
     counts = Counter(labels)
     print(f"Total rows read (raw): {total_rows} | Usable after filters: {kept}")
     print(f"Class counts after filters: {dict(counts)}")
-
     if not texts:
         raise ValueError("No valid rows after filtering.")
 
+    # Feature vectors
     samples = [score_features(t) for t in texts]
     X = [_vec(s) for s in samples]; y = labels
+    y = np.array(y)
 
+    # CV
     if cv and cv > 1:
         print(f"Running {cv}-fold cross-validation...")
-        kfold_eval(X, y, k=cv, seed=seed)
+        if cv_grouped:
+            kfold_eval_grouped(X, y, groups, k=cv)
+        else:
+            kfold_eval(X, y, k=cv, seed=seed)
         print("CV done.\n")
 
-    if no_holdout:
-        print("No-holdout mode: training on all samples.")
-        clf = LogisticRegression(
-            solver="lbfgs",
-            max_iter=5000,
-            C=0.5,
-            class_weight="balanced"
-        )
-        clf.fit(X, y)
-        joblib.dump({"model": clf, "feature_order": FEATURE_ORDER}, save_path)
-        print(f"Saved model to {save_path}")
-        return
+    # Leave-one-source-out eval (optional)
+    if eval_leave_one and len(set(groups)) > 1:
+        print("Leave-one-source-out evaluation:")
+        for g in sorted(set(groups)):
+            tr_idx = [i for i, gg in enumerate(groups) if gg != g]
+            te_idx = [i for i, gg in enumerate(groups) if gg == g]
+            clf = LogisticRegression(solver="lbfgs", max_iter=5000, C=0.5, class_weight="balanced")
+            clf.fit([X[i] for i in tr_idx], y[tr_idx])
+            proba = clf.predict_proba([X[i] for i in te_idx])[:,1]
+            roc = roc_auc_score(y[te_idx], proba)
+            print(f"  Hold-out source {g}: ROC AUC={roc:.4f}")
+        print()
 
-    n = len(y)
-    min_test_size = max(test_size, 2 / n + 1e-9)
-    test_size = min(0.5, max(0.05, min_test_size))
-    Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=test_size, random_state=seed, stratify=y)
+    # Train/Test split
+    Xtr, Xte, ytr, yte, tr_idx, te_idx = train_test_split(
+        X, y, np.arange(len(y)), test_size=test_size, random_state=seed, stratify=y
+    )
     print(f"Train size: {len(ytr)} | Test size: {len(yte)}")
 
-    clf = LogisticRegression(
-        solver="lbfgs",
-        max_iter=5000,
-        C=0.5,
-        class_weight="balanced"
-    )
-    clf.fit(Xtr, ytr)
-    yhat = clf.predict(Xte); yproba = clf.predict_proba(Xte)[:,1]
+    # Feature model
+    feat_clf = LogisticRegression(solver="lbfgs", max_iter=5000, C=0.5, class_weight="balanced")
+    feat_clf.fit(Xtr, ytr)
+    feat_proba_tr = feat_clf.predict_proba(Xtr)[:,1]
+    feat_proba_te = feat_clf.predict_proba(Xte)[:,1]
 
-    print(f"Training complete. Holdout test_size={test_size:.2f} (n_test={len(yte)})")
+    # TF-IDF model (default ON)
+    tfidf_clf = None
+    tfidf_proba_tr = tfidf_proba_te = None
+    if use_tfidf:
+        tfidf_clf = build_tfidf_model()
+        tfidf_clf.fit([texts[i] for i in tr_idx], [int(y[i]) for i in tr_idx])
+        tfidf_proba_tr = tfidf_clf.predict_proba([texts[i] for i in tr_idx])[:,1]
+        tfidf_proba_te = tfidf_clf.predict_proba([texts[i] for i in te_idx])[:,1]
+
+    # Embeddings model (optional)
+    emb_clf = None
+    emb_proba_tr = emb_proba_te = None
+    if use_embeddings:
+        if not _HAS_ST:
+            raise RuntimeError("Embeddings requested but sentence-transformers not installed.")
+        emb_tr = embed_texts([texts[i] for i in tr_idx], embed_model)
+        emb_te = embed_texts([texts[i] for i in te_idx], embed_model)
+        emb_clf = LogisticRegression(max_iter=2000, class_weight="balanced")
+        emb_clf.fit(emb_tr, y[tr_idx])
+        emb_proba_tr = emb_clf.predict_proba(emb_tr)[:,1]
+        emb_proba_te = emb_clf.predict_proba(emb_te)[:,1]
+
+    # Evaluate & optionally blend
+    def prf(ytrue, scores, name):
+        roc = roc_auc_score(ytrue, scores)
+        thr_f1, best_f1 = best_threshold(ytrue, scores, metric="f1")
+        thr_p, best_p  = best_threshold(ytrue, scores, metric="precision")
+        thr_r, best_r  = best_threshold(ytrue, scores, metric="recall")
+        print(f"{name}: ROC AUC={roc:.4f} | best_F1_thr={thr_f1:.3f} F1={best_f1:.4f} | best_P_thr={thr_p:.3f} P={best_p:.4f} | best_R_thr={thr_r:.3f} R={best_r:.4f}")
+        return roc
+
+    print("Holdout metrics:")
+    roc_feat = prf(yte, feat_proba_te, "Features")
+
+    roc_tfidf = roc_emb = None
+    if tfidf_proba_te is not None:
+        roc_tfidf = prf(yte, tfidf_proba_te, "TF-IDF")
+    if emb_proba_te is not None:
+        roc_emb = prf(yte, emb_proba_te, "Embeddings")
+
+    weights = {"feat": 1.0, "tfidf": 0.0, "emb": 0.0}
+    if blend:
+        # Parse weights string, e.g., "feat=0.5,tfidf=0.5,emb=0.0"
+        try:
+            for kv in blend_weights.split(","):
+                k, v = kv.split("="); weights[k.strip()] = float(v)
+        except Exception:
+            print("WARNING: Could not parse --blend-weights, using defaults.")
+        # zero out unavailable channels
+        if not use_tfidf or tfidf_proba_te is None: weights["tfidf"] = 0.0
+        if not use_embeddings or emb_proba_te is None: weights["emb"] = 0.0
+        s = weights["feat"] + weights["tfidf"] + weights["emb"]
+        if s <= 0:  # fallback
+            weights = {"feat": 1.0, "tfidf": 0.0, "emb": 0.0}; s = 1.0
+        for k in weights: weights[k] = weights[k] / s
+
+        blend_te = weights["feat"]*feat_proba_te
+        if tfidf_proba_te is not None: blend_te += weights["tfidf"]*tfidf_proba_te
+        if emb_proba_te   is not None: blend_te += weights["emb"]*emb_proba_te
+        roc_blend = prf(yte, blend_te, f"BLEND (feat={weights['feat']:.2f}, tfidf={weights['tfidf']:.2f}, emb={weights['emb']:.2f})")
+
+    # Report + write classification report for feature model (baseline)
+    yhat = (feat_proba_te >= 0.5).astype(int)
     report = classification_report(yte, yhat, digits=4)
     print(report)
-    try:
-        roc = roc_auc_score(yte, yproba)
-        print("ROC AUC:", round(roc,4))
-    except Exception:
-        roc = None
-
     with open("train_report.txt", "w", encoding="utf-8") as f:
         f.write(f"Train size: {len(ytr)} | Test size: {len(yte)}\n")
         f.write(report)
-        if roc is not None:
-            f.write(f"\nROC AUC: {roc:.4f}\n")
-    print("Wrote metrics to train_report.txt")
 
-    joblib.dump({"model": clf, "feature_order": FEATURE_ORDER}, save_path)
+    # Save pack
+    pack = {
+        "feature_order": FEATURE_ORDER,
+        "feature_clf": feat_clf,
+        "has_tfidf": bool(tfidf_clf is not None),
+        "tfidf_clf": tfidf_clf,
+        "has_embeddings": bool(emb_clf is not None),
+        "emb_clf": emb_clf,
+        "embed_model": embed_model if emb_clf is not None else None,
+        "blend": bool(blend),
+        "weights": weights,
+        "channels": {
+            "feat": True,
+            "tfidf": bool(tfidf_clf is not None),
+            "emb":   bool(emb_clf is not None)
+        }
+    }
+    joblib.dump(pack, save_path)
     print(f"Saved model to {save_path}")
 
 def load_model(path: str = MODEL_DEFAULT_PATH):
-    data = joblib.load(path)
-    return data["model"], data["feature_order"]
+    return joblib.load(path)
 
 def predict(text: str, model_path: str = MODEL_DEFAULT_PATH) -> Dict[str,Any]:
+    pack = load_model(model_path)
     feats = score_features(text)
     out = {
         "features": feats,
         "heuristic_score_0_100": feats["ai_likelihood_score_0_100"],
         "heuristic_label": classify(feats["ai_likelihood_score_0_100"])
     }
-    if os.path.exists(model_path):
-        try:
-            model, feature_order = load_model(model_path)
-            vec = [_vec(feats)]
-            proba = float(model.predict_proba(vec)[0,1])
-            out["model_probability_ai"] = round(proba,4)
-            out["model_label"] = int(proba >= 0.5)
-        except Exception as e:
-            out["model_error"] = str(e)
+    try:
+        # Feature channel
+        feat_vec = np.array([_vec(feats)], dtype=float)
+        feat_proba = pack["feature_clf"].predict_proba(feat_vec)[:,1][0]
+
+        # TF-IDF channel
+        tfidf_proba = None
+        if pack.get("has_tfidf") and pack.get("tfidf_clf") is not None:
+            tfidf_proba = float(pack["tfidf_clf"].predict_proba([text])[:,1][0])
+
+        # Embeddings channel
+        emb_proba = None
+        if pack.get("has_embeddings") and pack.get("emb_clf") is not None:
+            if not _HAS_ST:
+                raise RuntimeError("Embedded model saved but sentence-transformers not installed.")
+            st = SentenceTransformer(pack.get("embed_model"))
+            emb = st.encode([text], batch_size=1, convert_to_numpy=True, normalize_embeddings=True)
+            emb_proba = float(pack["emb_clf"].predict_proba(emb)[:,1][0])
+
+        if pack.get("blend"):
+            w = pack.get("weights", {"feat":1.0, "tfidf":0.0, "emb":0.0})
+            score = w["feat"]*feat_proba + (w["tfidf"]*(tfidf_proba or 0.0)) + (w["emb"]*(emb_proba or 0.0))
+            out["model_probability_ai"] = round(float(score),4)
+            out["model_label"] = int(score >= 0.5)
+            out["channels"] = {
+                "feat": round(float(feat_proba),4),
+                "tfidf": round(float(tfidf_proba),4) if tfidf_proba is not None else None,
+                "emb": round(float(emb_proba),4) if emb_proba is not None else None,
+                "weights": w
+            }
+        else:
+            out["model_probability_ai"] = round(float(feat_proba),4)
+            out["model_label"] = int(feat_proba >= 0.5)
+    except Exception as e:
+        out["model_error"] = str(e)
     return out
 
 # ---------------- Unsupervised (human-only training) ----------------
@@ -397,7 +547,7 @@ def unsup_train_humans(csv_paths: List[str],
                        threshold_percentile: float = 90.0,
                        dedupe: bool = True, approx_dedupe: bool = False,
                        max_svm: int = 12000, max_lof: int = 20000, sample_seed: int = 42):
-    texts, labels, total_rows, kept = read_csvs(csv_paths, dedupe=dedupe, approx_dedupe=approx_dedupe)
+    texts, labels, total_rows, kept, _groups = read_csvs(csv_paths, dedupe=dedupe, approx_dedupe=approx_dedupe)
     humans = [t for t, y in zip(texts, labels) if y == 0]
     if not humans:
         raise ValueError("No human (label=0) rows found after filtering.")
@@ -407,8 +557,6 @@ def unsup_train_humans(csv_paths: List[str],
     feats = [score_features(t) for t in humans]
     X = np.vstack([_to_vec(f, feature_order) for f in feats])
     Xz, mu, sigma = _standardize(X)
-
-    # Optional downcast to save RAM (not necessary at 40k, but harmless)
     Xz = Xz.astype(np.float32, copy=False)
 
     n_total = Xz.shape[0]
@@ -422,7 +570,7 @@ def unsup_train_humans(csv_paths: List[str],
     models = {}
     scores = []
 
-    # --- One-Class SVM (subsample if large) ---
+    # One-Class SVM (subsample)
     if model_type in ("svm","ensemble"):
         idx_svm = choose_idx(max_svm)
         ocsvm = OneClassSVM(kernel="rbf", nu=outlier_frac, gamma="scale")
@@ -432,7 +580,7 @@ def unsup_train_humans(csv_paths: List[str],
         models["ocsvm"] = ocsvm
         scores.append(s)
 
-    # --- Isolation Forest (full data, parallel) ---
+    # Isolation Forest (full, parallel)
     if model_type in ("iforest","ensemble"):
         iforest = IsolationForest(contamination=outlier_frac, n_estimators=300, random_state=42, n_jobs=-1)
         iforest.fit(Xz)
@@ -441,7 +589,7 @@ def unsup_train_humans(csv_paths: List[str],
         models["iforest"] = iforest
         scores.append(s)
 
-    # --- LOF (train novelty model on subsample; evaluate on full) ---
+    # LOF (novelty=True on subsample; score full)
     if model_type in ("lof","ensemble"):
         idx_lof = choose_idx(max_lof)
         lof = LocalOutlierFactor(n_neighbors=35, novelty=True, n_jobs=-1)
@@ -451,7 +599,7 @@ def unsup_train_humans(csv_paths: List[str],
         models["lof"] = {"novelty": lof, "idx": idx_lof}
         scores.append(s_full)
 
-    # --- Mahalanobis (full data) ---
+    # Mahalanobis (full)
     if model_type in ("mahalanobis","ensemble"):
         cov = EmpiricalCovariance().fit(Xz)
         md2 = cov.mahalanobis(Xz)
@@ -462,7 +610,6 @@ def unsup_train_humans(csv_paths: List[str],
 
     if not scores:
         raise ValueError("No unsupervised models selected.")
-
     S = np.vstack(scores).T
     ensemble_score = S.mean(axis=1)
 
@@ -482,7 +629,6 @@ def unsup_train_humans(csv_paths: List[str],
 def _unsup_normality_score(xz: np.ndarray, dump_obj: dict) -> float:
     models = dump_obj["models"]
     scores = []
-
     if "ocsvm" in models:
         s = models["ocsvm"].decision_function(xz).ravel()
         s = (s - s.min())/(s.max()-s.min()+1e-9)
@@ -502,7 +648,6 @@ def _unsup_normality_score(xz: np.ndarray, dump_obj: dict) -> float:
         s = -md2
         s = (s - s.min())/(s.max()-s.min()+1e-9)
         scores.append(s)
-
     if not scores:
         return 0.0
     S = np.vstack(scores).T
@@ -558,82 +703,50 @@ def humanization_tips(text: str, feats: Dict[str,Any]) -> List[str]:
     return tips
 
 def light_rewrite(text: str) -> str:
-    """Conservative rewrite:
-       - soften connectors
-       - mild phrase de-dup within each sentence
-       - tiny passive→active nudge
-       - fallback if we cut too much
-    """
     if not text or not text.strip():
         return text
-
     original = text
-
-    # 1) soften connectors
     out = text
     for k, v in AIISH_PHRASES.items():
         out = re.sub(rf"\b{k}\b", v, out, flags=re.IGNORECASE)
-
-    # 2) sentence-level processing
     sents = sent_tokenize(out)
     rewritten_sents = []
     for s in sents:
         tokens = word_tokenize(s)
-        # rolling-window de-dup but keep at least 80% of tokens in the sentence
-        window = 7
-        keep = []
-        seen = set()
-        i = 0
+        window = 7; keep = []; seen = set(); i = 0
         while i < len(tokens):
             j = min(i + window, len(tokens))
             sh = " ".join(tokens[i:j]).lower()
             if sh in seen and len(keep) > int(0.8 * len(tokens)):
-                i += window
-                continue
-            seen.add(sh)
-            keep.append(tokens[i])
-            i += 1
-
+                i += window; continue
+            seen.add(sh); keep.append(tokens[i]); i += 1
         s2 = " ".join(keep)
         s2 = re.sub(r"\s+([,.!?;:])", r"\1", s2)
-
-        # tiny passive→active tweak (very conservative)
         s2 = re.sub(r"\bwas\b\s+([a-z]+ed)\b\s+by\b", r"\1 by", s2, flags=re.IGNORECASE)
         s2 = re.sub(r"\bwere\b\s+([a-z]+ed)\b\s+by\b", r"\1 by", s2, flags=re.IGNORECASE)
-
-        s2 = s2.strip()
-        if not s2:
-            s2 = s.strip()
+        s2 = s2.strip() or s.strip()
         rewritten_sents.append(s2)
-
     out = " ".join(rewritten_sents).strip()
-
-    # 3) final rhythm tweak: only split truly long sentences
     final_sents = []
     for s in sent_tokenize(out):
         if len(word_tokenize(s)) > 34:
             s = s.replace(" — ", ". ").replace("; ", ". ")
         final_sents.append(s.strip())
     out = " ".join(final_sents).strip()
-
-    # 4) punctuation & safety fallbacks
     out = re.sub(r"\s+([,.!?;:])", r"\1", out)
-    if not out.endswith((".", "!", "?")):
-        out += "."
+    if not out.endswith((".", "!", "?")): out += "."
     if len(out) < max(80, int(0.6 * len(original))):
         minimal = original
         for k, v in AIISH_PHRASES.items():
             minimal = re.sub(rf"\b{k}\b", v, minimal, flags=re.IGNORECASE)
         minimal = re.sub(r"\s+([,.!?;:])", r"\1", minimal).strip()
-        if not minimal.endswith((".", "!", "?")):
-            minimal += "."
+        if not minimal.endswith((".", "!", "?")): minimal += "."
         out = minimal
-
     return out
 
 # ---------------- CLI ----------------
 def main():
-    ap = argparse.ArgumentParser(description="AI-content detector: heuristic + supervised + unsupervised (+ tips)")
+    ap = argparse.ArgumentParser(description="AI-content detector: heuristic + supervised + unsupervised (+ TF-IDF/Embeddings/Blend)")
     # supervised
     ap.add_argument("--train", nargs="+", help="Train supervised model from 1+ CSVs (columns text,label 0/1)")
     ap.add_argument("--use-model", type=str, default=MODEL_DEFAULT_PATH, help="Path to supervised model .joblib")
@@ -643,9 +756,17 @@ def main():
     ap.add_argument("--test-size", type=float, default=0.20, help="Test fraction for holdout (0.05–0.5)")
     ap.add_argument("--no-holdout", action="store_true", help="Train on all data (no test split)")
     ap.add_argument("--cv", type=int, default=0, help="Run K-fold CV (e.g., --cv 5) before holdout")
+    ap.add_argument("--cv-grouped", action="store_true", help="Use GroupKFold by source file for CV")
+    ap.add_argument("--eval-leave-one", action="store_true", help="Leave-one-source-out evaluation (by file)")
     ap.add_argument("--seed", type=int, default=42, help="Random seed for splits")
     ap.add_argument("--dedupe", action="store_true", help="Exact/normalized dedupe across merged CSVs")
     ap.add_argument("--approx-dedupe", action="store_true", help="Approximate dedupe via shingle hash")
+    # blend/extra models
+    ap.add_argument("--no-tfidf", action="store_true", help="Disable TF-IDF model")
+    ap.add_argument("--use-embeddings", action="store_true", help="Add sentence-transformer embeddings model")
+    ap.add_argument("--embed-model", type=str, default="sentence-transformers/all-MiniLM-L6-v2", help="Sentence-Transformer model name")
+    ap.add_argument("--blend", action="store_true", help="Save blended pack (feature + tfidf [+ emb])")
+    ap.add_argument("--blend-weights", type=str, default="feat=0.5,tfidf=0.5,emb=0.0", help="Blend weights, e.g., 'feat=0.4,tfidf=0.4,emb=0.2'")
     # unsupervised
     ap.add_argument("--unsup-train-humans", nargs="+", help="Train unsupervised model on 1+ CSVs (human rows only)")
     ap.add_argument("--unsup-model", type=str, default=UNSUP_DEFAULT_PATH, help="Path to unsupervised model .joblib")
@@ -655,26 +776,34 @@ def main():
     ap.add_argument("--unsup-thr", type=float, default=90.0, help="Calibration percentile (higher=stricter)")
     ap.add_argument("--unsup-check", type=str, help="Check a raw string (unsupervised)")
     ap.add_argument("--unsup-check-file", type=str, help="Check a file (unsupervised)")
-    # NEW: big-dataset toggles
     ap.add_argument("--unsup-max-svm", type=int, default=12000, help="Max rows for OCSVM training (subsample if larger)")
     ap.add_argument("--unsup-max-lof", type=int, default=20000, help="Max rows for LOF training (subsample if larger)")
     ap.add_argument("--unsup-sample-seed", type=int, default=42, help="Random seed for subsampling")
 
     args = ap.parse_args()
 
-    # --- Supervised train ---
+    # supervised train
     if args.train:
-        train_from_csv(args.train,
-                       save_path=args.use_model,
-                       test_size=args.test_size,
-                       no_holdout=args.no_holdout,
-                       dedupe=args.dedupe,
-                       approx_dedupe=args.approx_dedupe,
-                       cv=args.cv,
-                       seed=args.seed)
+        train_from_csv(
+            args.train,
+            save_path=args.use_model,
+            test_size=args.test_size,
+            no_holdout=args.no_holdout,
+            dedupe=args.dedupe,
+            approx_dedupe=args.approx_dedupe,
+            cv=args.cv,
+            seed=args.seed,
+            cv_grouped=args.cv_grouped,
+            use_tfidf=not args.no_tfidf,
+            use_embeddings=args.use_embeddings,
+            embed_model=args.embed_model,
+            blend=args.blend,
+            blend_weights=args.blend_weights,
+            eval_leave_one=args.eval_leave_one
+        )
         return
 
-    # --- Supervised check ---
+    # supervised check
     if args.check is not None or args.check_file:
         text = args.check
         if args.check_file:
@@ -687,15 +816,17 @@ def main():
         print("Heuristic score:", res["heuristic_score_0_100"], "→", res["heuristic_label"])
         if "model_probability_ai" in res:
             print("Model prob (AI):", res["model_probability_ai"], "label:", res.get("model_label"))
-        print("\nTop tips to humanize ethically:")
-        for tip in humanization_tips(text, feats):
-            print(" -", tip)
+            if "channels" in res:
+                ch = res["channels"]; print("Channels:", ch)
         if args.rewrite:
+            print("\nTop tips to humanize ethically:")
+            for tip in humanization_tips(text, feats):
+                print(" -", tip)
             print("\n--- Light rewrite (review before using) ---")
             print(light_rewrite(text))
         return
 
-    # --- Unsupervised train ---
+    # unsupervised train
     if args.unsup_train_humans:
         unsup_train_humans(args.unsup_train_humans,
                            save_path=args.unsup_model,
@@ -709,7 +840,7 @@ def main():
                            sample_seed=args.unsup_sample_seed)
         return
 
-    # --- Unsupervised check ---
+    # unsupervised check
     if args.unsup_check is not None or args.unsup_check_file:
         text = args.unsup_check
         if args.unsup_check_file:
