@@ -47,6 +47,14 @@ try:
 except Exception:
     _HAS_ST = False
 
+# near the top after imports
+try:
+    import torch
+    if torch.cuda.is_available():
+        torch.set_float32_matmul_precision("high")
+except Exception:
+    pass
+
 MODEL_DEFAULT_PATH = "anti_ai_model.joblib"
 UNSUP_DEFAULT_PATH = "anti_ai_unsup.joblib"
 
@@ -319,8 +327,38 @@ def build_tfidf_model():
 def embed_texts(texts: List[str], model_name: str):
     if not _HAS_ST:
         raise RuntimeError("sentence-transformers not installed. Run: pip install sentence-transformers")
-    st = SentenceTransformer(model_name)
-    return st.encode(texts, batch_size=64, convert_to_numpy=True, normalize_embeddings=True)
+    import torch
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    st = SentenceTransformer(model_name, device=device)
+
+    # Speed/VRAM trade-off for long academic texts:
+    # 256 is a great default on GPU; go 384 or 512 if you have tons of VRAM and want a tiny accuracy bump.
+    st.max_seq_length = 256
+
+    # Larger batch on GPU. Tune per VRAM:
+    # 8–10 GB: 64   | 12–16 GB: 96–128  | 24+ GB: 192–256
+    batch = 128 if device == "cuda" else 16
+
+    # mixed-precision inference on GPU = big speedup, tiny/no accuracy loss
+    if device == "cuda":
+        import torch
+        with torch.cuda.amp.autocast(dtype=torch.float16):
+            return st.encode(
+                texts,
+                batch_size=batch,
+                convert_to_numpy=True,
+                normalize_embeddings=True,
+                show_progress_bar=True,
+            )
+    else:
+        return st.encode(
+            texts,
+            batch_size=batch,
+            convert_to_numpy=True,
+            normalize_embeddings=True,
+            show_progress_bar=True,
+        )
+
 
 def best_threshold(y_true, scores, metric="f1"):
     ps, rs, ts = precision_recall_curve(y_true, scores)
@@ -345,7 +383,8 @@ def train_from_csv(csv_paths: List[str], save_path: str = MODEL_DEFAULT_PATH,
                    use_tfidf: bool = True, use_embeddings: bool = False,
                    embed_model: str = "sentence-transformers/all-MiniLM-L6-v2",
                    blend: bool = True, blend_weights: str = "feat=0.5,tfidf=0.5,emb=0.0",
-                   eval_leave_one: bool = False):
+                   eval_leave_one: bool = False, 
+                   op_metric: str = "f1"):
     texts, labels, total_rows, kept, groups = read_csvs(csv_paths, dedupe=dedupe, approx_dedupe=approx_dedupe)
     counts = Counter(labels)
     print(f"Total rows read (raw): {total_rows} | Usable after filters: {kept}")
@@ -436,7 +475,9 @@ def train_from_csv(csv_paths: List[str], save_path: str = MODEL_DEFAULT_PATH,
     if blend:
         # Parse weights string, e.g., "feat=0.5,tfidf=0.5,emb=0.0"
         try:
-            for kv in blend_weights.split(","):
+            for kv in (blend_weights or "").split(","):
+                if not kv.strip():
+                    continue
                 k, v = kv.split("="); weights[k.strip()] = float(v)
         except Exception:
             print("WARNING: Could not parse --blend-weights, using defaults.")
@@ -453,6 +494,18 @@ def train_from_csv(csv_paths: List[str], save_path: str = MODEL_DEFAULT_PATH,
         if emb_proba_te   is not None: blend_te += weights["emb"]*emb_proba_te
         roc_blend = prf(yte, blend_te, f"BLEND (feat={weights['feat']:.2f}, tfidf={weights['tfidf']:.2f}, emb={weights['emb']:.2f})")
 
+    # ------ NEW: choose and save an operating threshold from holdout ------
+    if blend and ('blend_te' in locals()):
+        scores_te_for_threshold = blend_te
+        channel_used = "blend"
+    else:
+        scores_te_for_threshold = feat_proba_te
+        channel_used = "features"
+
+    op_thr, op_val = best_threshold(yte, scores_te_for_threshold, metric=op_metric)
+    print(f"Selected operating threshold on holdout ({channel_used}, metric={op_metric}): threshold={op_thr:.3f}, score={op_val:.4f}")
+    # ---------------------------------------------------------------------
+
     # Report + write classification report for feature model (baseline)
     yhat = (feat_proba_te >= 0.5).astype(int)
     report = classification_report(yte, yhat, digits=4)
@@ -461,7 +514,7 @@ def train_from_csv(csv_paths: List[str], save_path: str = MODEL_DEFAULT_PATH,
         f.write(f"Train size: {len(ytr)} | Test size: {len(yte)}\n")
         f.write(report)
 
-    # Save pack
+    # Save pack (include threshold metadata)
     pack = {
         "feature_order": FEATURE_ORDER,
         "feature_clf": feat_clf,
@@ -476,7 +529,11 @@ def train_from_csv(csv_paths: List[str], save_path: str = MODEL_DEFAULT_PATH,
             "feat": True,
             "tfidf": bool(tfidf_clf is not None),
             "emb":   bool(emb_clf is not None)
-        }
+        },
+        # NEW: operating threshold info
+        "operating_threshold": float(op_thr),
+        "operating_metric": op_metric,
+        "operating_channel": channel_used,
     }
     joblib.dump(pack, save_path)
     print(f"Saved model to {save_path}")
@@ -525,6 +582,13 @@ def predict(text: str, model_path: str = MODEL_DEFAULT_PATH) -> Dict[str,Any]:
         else:
             out["model_probability_ai"] = round(float(feat_proba),4)
             out["model_label"] = int(feat_proba >= 0.5)
+
+        # NEW: expose saved operating threshold (if present)
+        if "operating_threshold" in pack:
+            out["saved_operating_threshold"] = float(pack["operating_threshold"])
+            out["saved_operating_metric"] = pack.get("operating_metric")
+            out["saved_operating_channel"] = pack.get("operating_channel")
+
     except Exception as e:
         out["model_error"] = str(e)
     return out
@@ -761,6 +825,10 @@ def main():
     ap.add_argument("--seed", type=int, default=42, help="Random seed for splits")
     ap.add_argument("--dedupe", action="store_true", help="Exact/normalized dedupe across merged CSVs")
     ap.add_argument("--approx-dedupe", action="store_true", help="Approximate dedupe via shingle hash")
+    ap.add_argument("--op-metric", choices=["f1","precision","recall"], default="f1",
+                help="Metric to choose the operating threshold on the holdout (default: f1)")
+    ap.add_argument("--use-saved-threshold", action="store_true",
+                help="During --check, use the saved operating threshold instead of 0.50")
     # blend/extra models
     ap.add_argument("--no-tfidf", action="store_true", help="Disable TF-IDF model")
     ap.add_argument("--use-embeddings", action="store_true", help="Add sentence-transformer embeddings model")
@@ -799,7 +867,8 @@ def main():
             embed_model=args.embed_model,
             blend=args.blend,
             blend_weights=args.blend_weights,
-            eval_leave_one=args.eval_leave_one
+            eval_leave_one=args.eval_leave_one,
+            op_metric=args.op_metric
         )
         return
 
@@ -814,10 +883,30 @@ def main():
         res = predict(text, model_path=args.use_model)
         feats = res["features"]
         print("Heuristic score:", res["heuristic_score_0_100"], "→", res["heuristic_label"])
+
+        # Show blended probability and optionally label using saved threshold
         if "model_probability_ai" in res:
-            print("Model prob (AI):", res["model_probability_ai"], "label:", res.get("model_label"))
+            prob = float(res["model_probability_ai"])
+            label_default = int(prob >= 0.5)
+
+            # Try to load the pack for the saved threshold
+            try:
+                pack = load_model(args.use_model)
+                if args.use_saved_threshold and "operating_threshold" in pack:
+                    thr = float(pack["operating_threshold"])
+                    label_saved = int(prob >= thr)
+                    print(f"Model prob (AI): {prob:.4f}  |  label@0.50: {label_default}  |  "
+                          f"label@saved_thr({thr:.3f}, {pack.get('operating_metric')} on {pack.get('operating_channel')}): {label_saved}")
+                else:
+                    print(f"Model prob (AI): {prob:.4f}  |  label@0.50: {label_default}")
+            except Exception:
+                print(f"Model prob (AI): {prob:.4f}  |  label@0.50: {label_default}")
+
+            # If channels were provided, show them
             if "channels" in res:
-                ch = res["channels"]; print("Channels:", ch)
+                ch = res["channels"]
+                print("Channels:", ch)
+
         if args.rewrite:
             print("\nTop tips to humanize ethically:")
             for tip in humanization_tips(text, feats):
