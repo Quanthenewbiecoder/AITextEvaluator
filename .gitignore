@@ -121,3 +121,5 @@ ruff_cache/
 
 collect_academic_humans.py
 make_synthetic_academic_ai_like.py
+train_report.txt
+label_datasets.py

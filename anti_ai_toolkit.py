@@ -1,6 +1,6 @@
 # anti_ai_toolkit.py
 # Heuristic AI-content detector + Supervised & Unsupervised pipelines (+ tips & light rewrite)
-# Now with: multi-CSV loading, deduplication, configurable test size, and K-fold CV.
+# Large-dataset friendly: subsampled OCSVM/LOF, parallel IF/LOF, optional float32 downcast
 # ---------------------------------------------------------------------------
 # Install (for training):
 #   pip install scikit-learn joblib numpy
@@ -218,7 +218,6 @@ def classify(score: float) -> str:
 
 # ---------------- Data loading / dedupe ----------------
 def normalize_text(s: str) -> str:
-    # lower, collapse spaces, strip punctuation spacing
     s2 = re.sub(r"\s+", " ", s).strip().lower()
     s2 = re.sub(r"\s+([,.!?;:])", r"\1", s2)
     return s2
@@ -271,7 +270,12 @@ def kfold_eval(X, y, k=5, seed=42):
     skf = StratifiedKFold(n_splits=k, shuffle=True, random_state=seed)
     accs, rocs = [], []
     for fold, (tr, te) in enumerate(skf.split(X, y), 1):
-        clf = LogisticRegression(max_iter=1000, class_weight="balanced")
+        clf = LogisticRegression(
+            solver="lbfgs",
+            max_iter=5000,
+            C=0.5,
+            class_weight="balanced"
+        )
         Xtr = [X[i] for i in tr]; ytr = [y[i] for i in tr]
         Xte = [X[i] for i in te]; yte = [y[i] for i in te]
         clf.fit(Xtr, ytr)
@@ -290,7 +294,6 @@ def kfold_eval(X, y, k=5, seed=42):
 def train_from_csv(csv_paths: List[str], save_path: str = MODEL_DEFAULT_PATH,
                    test_size: float = 0.20, no_holdout: bool = False,
                    dedupe: bool = True, approx_dedupe: bool = False, cv: int = 0, seed: int = 42):
-    # Load
     texts, labels, total_rows, kept = read_csvs(csv_paths, dedupe=dedupe, approx_dedupe=approx_dedupe)
     counts = Counter(labels)
     print(f"Total rows read (raw): {total_rows} | Usable after filters: {kept}")
@@ -302,29 +305,36 @@ def train_from_csv(csv_paths: List[str], save_path: str = MODEL_DEFAULT_PATH,
     samples = [score_features(t) for t in texts]
     X = [_vec(s) for s in samples]; y = labels
 
-    # Optional K-fold CV
     if cv and cv > 1:
         print(f"Running {cv}-fold cross-validation...")
         kfold_eval(X, y, k=cv, seed=seed)
         print("CV done.\n")
 
-    # No-holdout mode
     if no_holdout:
         print("No-holdout mode: training on all samples.")
-        clf = LogisticRegression(max_iter=1000, class_weight="balanced")
+        clf = LogisticRegression(
+            solver="lbfgs",
+            max_iter=5000,
+            C=0.5,
+            class_weight="balanced"
+        )
         clf.fit(X, y)
         joblib.dump({"model": clf, "feature_order": FEATURE_ORDER}, save_path)
         print(f"Saved model to {save_path}")
         return
 
-    # Holdout split with sanity bound
     n = len(y)
     min_test_size = max(test_size, 2 / n + 1e-9)
     test_size = min(0.5, max(0.05, min_test_size))
     Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=test_size, random_state=seed, stratify=y)
     print(f"Train size: {len(ytr)} | Test size: {len(yte)}")
 
-    clf = LogisticRegression(max_iter=1000, class_weight="balanced")
+    clf = LogisticRegression(
+        solver="lbfgs",
+        max_iter=5000,
+        C=0.5,
+        class_weight="balanced"
+    )
     clf.fit(Xtr, ytr)
     yhat = clf.predict(Xte); yproba = clf.predict_proba(Xte)[:,1]
 
@@ -385,7 +395,8 @@ def unsup_train_humans(csv_paths: List[str],
                        model_type: str = "ensemble",
                        outlier_frac: float = 0.1,
                        threshold_percentile: float = 90.0,
-                       dedupe: bool = True, approx_dedupe: bool = False):
+                       dedupe: bool = True, approx_dedupe: bool = False,
+                       max_svm: int = 12000, max_lof: int = 20000, sample_seed: int = 42):
     texts, labels, total_rows, kept = read_csvs(csv_paths, dedupe=dedupe, approx_dedupe=approx_dedupe)
     humans = [t for t, y in zip(texts, labels) if y == 0]
     if not humans:
@@ -397,36 +408,50 @@ def unsup_train_humans(csv_paths: List[str],
     X = np.vstack([_to_vec(f, feature_order) for f in feats])
     Xz, mu, sigma = _standardize(X)
 
+    # Optional downcast to save RAM (not necessary at 40k, but harmless)
+    Xz = Xz.astype(np.float32, copy=False)
+
+    n_total = Xz.shape[0]
+    rng = np.random.RandomState(sample_seed)
+
+    def choose_idx(limit):
+        if n_total <= limit:
+            return np.arange(n_total)
+        return rng.choice(n_total, size=limit, replace=False)
+
     models = {}
     scores = []
 
+    # --- One-Class SVM (subsample if large) ---
     if model_type in ("svm","ensemble"):
+        idx_svm = choose_idx(max_svm)
         ocsvm = OneClassSVM(kernel="rbf", nu=outlier_frac, gamma="scale")
-        ocsvm.fit(Xz)
+        ocsvm.fit(Xz[idx_svm])
         s = ocsvm.decision_function(Xz).ravel()
         s = (s - s.min())/(s.max()-s.min()+1e-9)
         models["ocsvm"] = ocsvm
         scores.append(s)
 
+    # --- Isolation Forest (full data, parallel) ---
     if model_type in ("iforest","ensemble"):
-        iforest = IsolationForest(contamination=outlier_frac, n_estimators=300, random_state=42)
+        iforest = IsolationForest(contamination=outlier_frac, n_estimators=300, random_state=42, n_jobs=-1)
         iforest.fit(Xz)
         s = iforest.score_samples(Xz)
         s = (s - s.min())/(s.max()-s.min()+1e-9)
         models["iforest"] = iforest
         scores.append(s)
 
+    # --- LOF (train novelty model on subsample; evaluate on full) ---
     if model_type in ("lof","ensemble"):
-        lof_train = LocalOutlierFactor(n_neighbors=35, contamination=outlier_frac, novelty=False)
-        lof_train.fit_predict(Xz)
-        s = -lof_train.negative_outlier_factor_
-        s = s.max() - s
-        s = (s - s.min())/(s.max()-s.min()+1e-9)
-        lof = LocalOutlierFactor(n_neighbors=35, novelty=True)
-        lof.fit(Xz)
-        models["lof"] = lof
-        scores.append(s)
+        idx_lof = choose_idx(max_lof)
+        lof = LocalOutlierFactor(n_neighbors=35, novelty=True, n_jobs=-1)
+        lof.fit(Xz[idx_lof])
+        s_full = lof.score_samples(Xz).ravel()
+        s_full = (s_full - s_full.min())/(s_full.max()-s_full.min()+1e-9)
+        models["lof"] = {"novelty": lof, "idx": idx_lof}
+        scores.append(s_full)
 
+    # --- Mahalanobis (full data) ---
     if model_type in ("mahalanobis","ensemble"):
         cov = EmpiricalCovariance().fit(Xz)
         md2 = cov.mahalanobis(Xz)
@@ -467,8 +492,8 @@ def _unsup_normality_score(xz: np.ndarray, dump_obj: dict) -> float:
         s = (s - s.min())/(s.max()-s.min()+1e-9)
         scores.append(s)
     if "lof" in models:
-        lof = models["lof"]
-        s = lof.score_samples(xz).ravel()
+        lof_obj = models["lof"]["novelty"]
+        s = lof_obj.score_samples(xz).ravel()
         s = (s - s.min())/(s.max()-s.min()+1e-9)
         scores.append(s)
     if "mahalanobis" in models:
@@ -535,9 +560,9 @@ def humanization_tips(text: str, feats: Dict[str,Any]) -> List[str]:
 def light_rewrite(text: str) -> str:
     """Conservative rewrite:
        - soften connectors
-       - mild phrase de-dup *within each sentence*
+       - mild phrase de-dup within each sentence
        - tiny passive→active nudge
-       - NEVER collapse to empty; fallback if we cut too much
+       - fallback if we cut too much
     """
     if not text or not text.strip():
         return text
@@ -563,7 +588,6 @@ def light_rewrite(text: str) -> str:
             j = min(i + window, len(tokens))
             sh = " ".join(tokens[i:j]).lower()
             if sh in seen and len(keep) > int(0.8 * len(tokens)):
-                # already same phrase and we’ve kept enough → skip this window
                 i += window
                 continue
             seen.add(sh)
@@ -577,10 +601,9 @@ def light_rewrite(text: str) -> str:
         s2 = re.sub(r"\bwas\b\s+([a-z]+ed)\b\s+by\b", r"\1 by", s2, flags=re.IGNORECASE)
         s2 = re.sub(r"\bwere\b\s+([a-z]+ed)\b\s+by\b", r"\1 by", s2, flags=re.IGNORECASE)
 
-        # keep sentence if it didn't become empty
         s2 = s2.strip()
         if not s2:
-            s2 = s.strip()  # fallback to original sentence
+            s2 = s.strip()
         rewritten_sents.append(s2)
 
     out = " ".join(rewritten_sents).strip()
@@ -597,9 +620,7 @@ def light_rewrite(text: str) -> str:
     out = re.sub(r"\s+([,.!?;:])", r"\1", out)
     if not out.endswith((".", "!", "?")):
         out += "."
-    # If we accidentally cut too much, fallback to a minimal edit version
     if len(out) < max(80, int(0.6 * len(original))):
-        # minimal edit: only connector softening + tidy spaces
         minimal = original
         for k, v in AIISH_PHRASES.items():
             minimal = re.sub(rf"\b{k}\b", v, minimal, flags=re.IGNORECASE)
@@ -634,6 +655,11 @@ def main():
     ap.add_argument("--unsup-thr", type=float, default=90.0, help="Calibration percentile (higher=stricter)")
     ap.add_argument("--unsup-check", type=str, help="Check a raw string (unsupervised)")
     ap.add_argument("--unsup-check-file", type=str, help="Check a file (unsupervised)")
+    # NEW: big-dataset toggles
+    ap.add_argument("--unsup-max-svm", type=int, default=12000, help="Max rows for OCSVM training (subsample if larger)")
+    ap.add_argument("--unsup-max-lof", type=int, default=20000, help="Max rows for LOF training (subsample if larger)")
+    ap.add_argument("--unsup-sample-seed", type=int, default=42, help="Random seed for subsampling")
+
     args = ap.parse_args()
 
     # --- Supervised train ---
@@ -677,7 +703,10 @@ def main():
                            outlier_frac=args.unsup_outlier_frac,
                            threshold_percentile=args.unsup_thr,
                            dedupe=args.dedupe,
-                           approx_dedupe=args.approx_dedupe)
+                           approx_dedupe=args.approx_dedupe,
+                           max_svm=args.unsup_max_svm,
+                           max_lof=args.unsup_max_lof,
+                           sample_seed=args.unsup_sample_seed)
         return
 
     # --- Unsupervised check ---
