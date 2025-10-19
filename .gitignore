@@ -36,6 +36,7 @@ Thumbs.db
 collectors/*.csv
 collectors/*.tsv
 collectors/*.json
+collectors/*.txt
 data/
 datasets/
 outputs/

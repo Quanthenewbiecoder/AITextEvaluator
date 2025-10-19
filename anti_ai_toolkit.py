@@ -38,7 +38,6 @@ from sklearn.covariance import EmpiricalCovariance
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.pipeline import make_pipeline
 from sklearn.calibration import CalibratedClassifierCV
-from sklearn.base import BaseEstimator
 
 # Optional embeddings
 try:
@@ -332,16 +331,10 @@ def embed_texts(texts: List[str], model_name: str):
     st = SentenceTransformer(model_name, device=device)
 
     # Speed/VRAM trade-off for long academic texts:
-    # 256 is a great default on GPU; go 384 or 512 if you have tons of VRAM and want a tiny accuracy bump.
     st.max_seq_length = 256
-
-    # Larger batch on GPU. Tune per VRAM:
-    # 8–10 GB: 64   | 12–16 GB: 96–128  | 24+ GB: 192–256
     batch = 128 if device == "cuda" else 16
 
-    # mixed-precision inference on GPU = big speedup, tiny/no accuracy loss
     if device == "cuda":
-        import torch
         with torch.cuda.amp.autocast(dtype=torch.float16):
             return st.encode(
                 texts,
@@ -358,7 +351,6 @@ def embed_texts(texts: List[str], model_name: str):
             normalize_embeddings=True,
             show_progress_bar=True,
         )
-
 
 def best_threshold(y_true, scores, metric="f1"):
     ps, rs, ts = precision_recall_curve(y_true, scores)
@@ -383,7 +375,7 @@ def train_from_csv(csv_paths: List[str], save_path: str = MODEL_DEFAULT_PATH,
                    use_tfidf: bool = True, use_embeddings: bool = False,
                    embed_model: str = "sentence-transformers/all-MiniLM-L6-v2",
                    blend: bool = True, blend_weights: str = "feat=0.5,tfidf=0.5,emb=0.0",
-                   eval_leave_one: bool = False, 
+                   eval_leave_one: bool = False,
                    op_metric: str = "f1"):
     texts, labels, total_rows, kept, groups = read_csvs(csv_paths, dedupe=dedupe, approx_dedupe=approx_dedupe)
     counts = Counter(labels)
@@ -494,7 +486,7 @@ def train_from_csv(csv_paths: List[str], save_path: str = MODEL_DEFAULT_PATH,
         if emb_proba_te   is not None: blend_te += weights["emb"]*emb_proba_te
         roc_blend = prf(yte, blend_te, f"BLEND (feat={weights['feat']:.2f}, tfidf={weights['tfidf']:.2f}, emb={weights['emb']:.2f})")
 
-    # ------ NEW: choose and save an operating threshold from holdout ------
+    # ------ choose and save an operating threshold from holdout ------
     if blend and ('blend_te' in locals()):
         scores_te_for_threshold = blend_te
         channel_used = "blend"
@@ -504,7 +496,7 @@ def train_from_csv(csv_paths: List[str], save_path: str = MODEL_DEFAULT_PATH,
 
     op_thr, op_val = best_threshold(yte, scores_te_for_threshold, metric=op_metric)
     print(f"Selected operating threshold on holdout ({channel_used}, metric={op_metric}): threshold={op_thr:.3f}, score={op_val:.4f}")
-    # ---------------------------------------------------------------------
+    # -----------------------------------------------------------------
 
     # Report + write classification report for feature model (baseline)
     yhat = (feat_proba_te >= 0.5).astype(int)
@@ -530,7 +522,6 @@ def train_from_csv(csv_paths: List[str], save_path: str = MODEL_DEFAULT_PATH,
             "tfidf": bool(tfidf_clf is not None),
             "emb":   bool(emb_clf is not None)
         },
-        # NEW: operating threshold info
         "operating_threshold": float(op_thr),
         "operating_metric": op_metric,
         "operating_channel": channel_used,
@@ -583,7 +574,7 @@ def predict(text: str, model_path: str = MODEL_DEFAULT_PATH) -> Dict[str,Any]:
             out["model_probability_ai"] = round(float(feat_proba),4)
             out["model_label"] = int(feat_proba >= 0.5)
 
-        # NEW: expose saved operating threshold (if present)
+        # expose saved operating threshold (if present)
         if "operating_threshold" in pack:
             out["saved_operating_threshold"] = float(pack["operating_threshold"])
             out["saved_operating_metric"] = pack.get("operating_metric")
@@ -633,24 +624,29 @@ def unsup_train_humans(csv_paths: List[str],
 
     models = {}
     scores = []
+    scalers = {}  # <-- NEW: per-model raw score min/max saved for inference scaling
 
     # One-Class SVM (subsample)
     if model_type in ("svm","ensemble"):
         idx_svm = choose_idx(max_svm)
         ocsvm = OneClassSVM(kernel="rbf", nu=outlier_frac, gamma="scale")
         ocsvm.fit(Xz[idx_svm])
-        s = ocsvm.decision_function(Xz).ravel()
-        s = (s - s.min())/(s.max()-s.min()+1e-9)
+        s_raw = ocsvm.decision_function(Xz).ravel()
+        mn, mx = float(s_raw.min()), float(s_raw.max())
+        s = (s_raw - mn) / (mx - mn + 1e-9)
         models["ocsvm"] = ocsvm
+        scalers["ocsvm"] = {"min": mn, "max": mx}
         scores.append(s)
 
     # Isolation Forest (full, parallel)
     if model_type in ("iforest","ensemble"):
         iforest = IsolationForest(contamination=outlier_frac, n_estimators=300, random_state=42, n_jobs=-1)
         iforest.fit(Xz)
-        s = iforest.score_samples(Xz)
-        s = (s - s.min())/(s.max()-s.min()+1e-9)
+        s_raw = iforest.score_samples(Xz).ravel()
+        mn, mx = float(s_raw.min()), float(s_raw.max())
+        s = (s_raw - mn) / (mx - mn + 1e-9)
         models["iforest"] = iforest
+        scalers["iforest"] = {"min": mn, "max": mx}
         scores.append(s)
 
     # LOF (novelty=True on subsample; score full)
@@ -658,22 +654,27 @@ def unsup_train_humans(csv_paths: List[str],
         idx_lof = choose_idx(max_lof)
         lof = LocalOutlierFactor(n_neighbors=35, novelty=True, n_jobs=-1)
         lof.fit(Xz[idx_lof])
-        s_full = lof.score_samples(Xz).ravel()
-        s_full = (s_full - s_full.min())/(s_full.max()-s_full.min()+1e-9)
+        s_raw = lof.score_samples(Xz).ravel()
+        mn, mx = float(s_raw.min()), float(s_raw.max())
+        s = (s_raw - mn) / (mx - mn + 1e-9)
         models["lof"] = {"novelty": lof, "idx": idx_lof}
-        scores.append(s_full)
+        scalers["lof"] = {"min": mn, "max": mx}
+        scores.append(s)
 
     # Mahalanobis (full)
     if model_type in ("mahalanobis","ensemble"):
         cov = EmpiricalCovariance().fit(Xz)
         md2 = cov.mahalanobis(Xz)
-        s = -md2
-        s = (s - s.min())/(s.max()-s.min()+1e-9)
+        s_raw = -md2  # higher = more normal
+        mn, mx = float(s_raw.min()), float(s_raw.max())
+        s = (s_raw - mn) / (mx - mn + 1e-9)
         models["mahalanobis"] = {"cov": cov}
+        scalers["mahalanobis"] = {"min": mn, "max": mx}
         scores.append(s)
 
     if not scores:
         raise ValueError("No unsupervised models selected.")
+
     S = np.vstack(scores).T
     ensemble_score = S.mean(axis=1)
 
@@ -684,37 +685,64 @@ def unsup_train_humans(csv_paths: List[str],
         "models": models,
         "model_type": model_type,
         "threshold": float(thr),
-        "calibration_percentile": threshold_percentile
+        "calibration_percentile": threshold_percentile,
+        "scalers": scalers,  # <-- NEW
     }
     joblib.dump(dump_obj, save_path)
     print(f"[UNSUP] Trained on {len(humans)} human texts. Saved to {save_path}.")
     print(f"[UNSUP] Threshold (anomaly if normality < {thr:.4f}) at {threshold_percentile}th percentile.")
 
 def _unsup_normality_score(xz: np.ndarray, dump_obj: dict) -> float:
+    def _scale(v, mn, mx):
+        return (v - mn) / (mx - mn + 1e-9)
+
     models = dump_obj["models"]
+    scalers = dump_obj.get("scalers", {})  # may be missing in old models
     scores = []
+
     if "ocsvm" in models:
-        s = models["ocsvm"].decision_function(xz).ravel()
-        s = (s - s.min())/(s.max()-s.min()+1e-9)
+        s_raw = models["ocsvm"].decision_function(xz).ravel()
+        if "ocsvm" in scalers:
+            mn, mx = scalers["ocsvm"]["min"], scalers["ocsvm"]["max"]
+            s = _scale(s_raw, mn, mx)
+        else:
+            s = s_raw  # fallback for legacy model
         scores.append(s)
+
     if "iforest" in models:
-        s = models["iforest"].score_samples(xz).ravel()
-        s = (s - s.min())/(s.max()-s.min()+1e-9)
+        s_raw = models["iforest"].score_samples(xz).ravel()
+        if "iforest" in scalers:
+            mn, mx = scalers["iforest"]["min"], scalers["iforest"]["max"]
+            s = _scale(s_raw, mn, mx)
+        else:
+            s = s_raw
         scores.append(s)
+
     if "lof" in models:
         lof_obj = models["lof"]["novelty"]
-        s = lof_obj.score_samples(xz).ravel()
-        s = (s - s.min())/(s.max()-s.min()+1e-9)
+        s_raw = lof_obj.score_samples(xz).ravel()
+        if "lof" in scalers:
+            mn, mx = scalers["lof"]["min"], scalers["lof"]["max"]
+            s = _scale(s_raw, mn, mx)
+        else:
+            s = s_raw
         scores.append(s)
+
     if "mahalanobis" in models:
         cov = models["mahalanobis"]["cov"]
         md2 = cov.mahalanobis(xz)
-        s = -md2
-        s = (s - s.min())/(s.max()-s.min()+1e-9)
+        s_raw = -md2
+        if "mahalanobis" in scalers:
+            mn, mx = scalers["mahalanobis"]["min"], scalers["mahalanobis"]["max"]
+            s = _scale(s_raw, mn, mx)
+        else:
+            s = s_raw
         scores.append(s)
+
     if not scores:
         return 0.0
-    S = np.vstack(scores).T
+
+    S = np.vstack(scores).T  # shape (n_samples, n_models)
     return float(S.mean(axis=1)[0])
 
 def unsup_predict(text: str, model_path: str = UNSUP_DEFAULT_PATH) -> dict:
@@ -808,6 +836,246 @@ def light_rewrite(text: str) -> str:
         out = minimal
     return out
 
+# ---------- Helpers for strict rewrite length control ----------
+def _tokens_len(tokens):
+    return sum(1 for t in tokens if re.match(r"[A-Za-z]+|\d+", t))
+
+def _trim_to_token_len(text: str, target_len: int) -> str:
+    toks = word_tokenize(text)
+    out = []
+    count = 0
+    for t in toks:
+        if re.match(r"[A-Za-z]+|\d+", t):
+            if count >= target_len:
+                break
+            count += 1
+        out.append(t)
+    s = " ".join(out)
+    s = re.sub(r"\s+([,.!?;:])", r"\1", s)
+    s = re.sub(r"\s{2,}", " ", s).strip()
+    return s
+
+def _soften_connectors_simple(t: str, keep=2):
+    CONNECTORS = [
+        "however","moreover","furthermore","additionally","therefore","thus",
+        "in addition","on the other hand","as a result","consequently","notably",
+        "in summary","in conclusion","overall","meanwhile","nevertheless","nonetheless"
+    ]
+    count = 0
+    def repl(m):
+        nonlocal count
+        count += 1
+        return m.group(0) if count <= keep else ""
+    sorted_conns = sorted(CONNECTORS, key=len, reverse=True)
+    out = t
+    for c in sorted_conns:
+        out = re.sub(rf"\b{re.escape(c)}\b[,\s]*", repl, out, flags=re.IGNORECASE)
+    out = re.sub(r"\s{2,}", " ", out)
+    out = re.sub(r"\s+([,.!?;:])", r"\1", out)
+    return out.strip()
+
+def _vary_long_sentences(t: str) -> str:
+    sents = sent_tokenize(t)
+    new = []
+    for s in sents:
+        if len(word_tokenize(s)) > 34:
+            s = s.replace(" — ", ". ").replace("; ", ". ")
+        new.append(s.strip())
+    out = " ".join(new)
+    out = re.sub(r"\s+([,.!?;:])", r"\1", out).strip()
+    return out
+
+# ---------- STRICT humanizer that preserves exact token count ----------
+# - Optimizes unsupervised normality score
+# - Enforces len(word_tokenize(out)) == original_len
+# - Avoids adding invented details; only stylistic/lexical changes
+
+EXPAND_MAP = {
+    "use": "make use",
+    "uses": "makes use",
+    "used": "made use",
+    "improve": "make better",
+    "improves": "makes better",
+    "improved": "made better",
+    "show": "make clear",
+    "shows": "makes clear",
+    "help": "be helpful",
+    "helps": "is helpful",
+    "test": "carry out tests",
+    "tests": "carries out tests",
+    "analyze": "look into",
+    "analyzes": "looks into",
+    "method": "working method",
+    "methods": "working methods",
+    "approach": "practical approach",
+    "approaches": "practical approaches"
+}
+
+TRIM_WORDS = {
+    "very","really","quite","rather","actually","basically","generally","overall",
+    "indeed","clearly","significantly","highly","extremely","truly","notably"
+}
+
+# mild, clean substitutions to break up “AI-y” phrasing
+LEX_SWAPS = {
+    r"\bmoreover\b": "also",
+    r"\bfurthermore\b": "also",
+    r"\badditionally\b": "also",
+    r"\btherefore\b": "so",
+    r"\bthus\b": "so",
+    r"\bin conclusion\b": "to wrap up",
+    r"\bin summary\b": "overall",
+    r"\bconsequently\b": "as a result"
+}
+
+def _join_tokens(tokens: list[str]) -> str:
+    out = " ".join(tokens)
+    out = re.sub(r"\s+([,.!?;:])", r"\1", out)
+    out = re.sub(r"\(\s+", "(", out)
+    out = re.sub(r"\s+\)", ")", out)
+    return out.strip()
+
+def _expand_to_length(tokens: list[str], target_len: int) -> list[str]:
+    if len(tokens) >= target_len:
+        return tokens
+    i = 0
+    while len(tokens) < target_len and i < len(tokens):
+        w = tokens[i]
+        wl = w.lower()
+        if re.match(r"^[A-Za-z]+$", w) and wl in EXPAND_MAP:
+            repl = EXPAND_MAP[wl].split()
+            tokens = tokens[:i] + repl + tokens[i+1:]
+            i += len(repl)
+        elif w.lower() in {"it's","that's","there's","we're","they're","i'm","don't","can't","won't","isn't","aren't"}:
+            exp = w.replace("’","'").lower()
+            exp = (exp
+                   .replace("it's","it is")
+                   .replace("that's","that is")
+                   .replace("there's","there is")
+                   .replace("we're","we are")
+                   .replace("they're","they are")
+                   .replace("i'm","i am")
+                   .replace("don't","do not")
+                   .replace("can't","cannot")
+                   .replace("won't","will not")
+                   .replace("isn't","is not")
+                   .replace("aren't","are not"))
+            tokens = tokens[:i] + exp.split() + tokens[i+1:]
+            i += 2
+        else:
+            i += 1
+    return tokens
+
+def _trim_to_length(tokens: list[str], target_len: int) -> list[str]:
+    if len(tokens) <= target_len:
+        return tokens
+    keep = []
+    removed = 0
+    for t in tokens:
+        if len(tokens) - removed <= target_len:
+            keep.append(t); continue
+        tl = t.lower()
+        if re.match(r"^[A-Za-z]+$", t) and tl in TRIM_WORDS:
+            removed += 1
+        else:
+            keep.append(t)
+    tokens = keep
+
+    if len(tokens) > target_len:
+        keep = []
+        removed = 0
+        for t in tokens:
+            if len(tokens) - removed <= target_len:
+                keep.append(t); continue
+            if t == "," or t.lower() == "that":
+                removed += 1
+            else:
+                keep.append(t)
+        tokens = keep
+
+    if len(tokens) > target_len:
+        keep = []
+        removed = 0
+        for i, t in enumerate(tokens):
+            if len(tokens) - removed <= target_len:
+                keep.append(t); continue
+            if t.lower() in {"the","a","an"}:
+                if i > 0 and not re.match(r"^[A-Z]", tokens[i+1] if i+1 < len(tokens) else ""):
+                    removed += 1
+                    continue
+            keep.append(t)
+        tokens = keep
+
+    while len(tokens) > target_len:
+        if re.match(r"[^\w\s]", tokens[-1]):
+            tokens.pop()
+        else:
+            tokens.pop()
+    return tokens
+
+def _apply_lex_swaps(txt: str) -> str:
+    out = txt
+    for pat, repl in LEX_SWAPS.items():
+        out = re.sub(pat, repl, out, flags=re.IGNORECASE)
+    return out
+
+
+# ---------- Strict humanizer (exact-length, unsupervised-guided) ----------
+def strict_humanize_with_unsup(text: str, dump_obj: dict,
+                               max_iters: int = 6,
+                               keep_connectors: int = 1) -> tuple[str, float]:
+    import numpy as np
+    target_len = len(word_tokenize(text))
+
+    def norm_score(t: str) -> float:
+        feats = score_features(t)
+        vec = np.array([[float(feats.get(f, 0.0)) for f in dump_obj["feature_order"]]], dtype=float)
+        mu, sigma = dump_obj["mu"], dump_obj["sigma"]
+        xz = (vec - mu) / sigma
+        return _unsup_normality_score(xz, dump_obj)
+
+    best = text.strip()
+    best = _apply_lex_swaps(light_rewrite(best))
+    best_tokens = word_tokenize(best)
+    if len(best_tokens) < target_len:
+        best_tokens = _expand_to_length(best_tokens, target_len)
+    elif len(best_tokens) > target_len:
+        best_tokens = _trim_to_length(best_tokens, target_len)
+    best = _join_tokens(best_tokens)
+    best_norm = norm_score(best)
+
+    for _ in range(max_iters):
+        cand = _apply_lex_swaps(light_rewrite(best))
+        count = 0
+        def soft_conn(m):
+            nonlocal count
+            count += 1
+            return m.group(0) if count <= keep_connectors else ""
+        for c in ["however","moreover","furthermore","additionally","therefore","thus","in addition","consequently","in summary","overall"]:
+            cand = re.sub(rf"\b{re.escape(c)}\b[,\s]*", soft_conn, cand, flags=re.IGNORECASE)
+
+        tokens = word_tokenize(cand)
+        if len(tokens) < target_len:
+            tokens = _expand_to_length(tokens, target_len)
+        elif len(tokens) > target_len:
+            tokens = _trim_to_length(tokens, target_len)
+        cand = _join_tokens(tokens)
+
+        if ":" not in cand and "," in cand:
+            cand = cand.replace(",", ":", 1)
+
+        cand_norm = norm_score(cand)
+        if cand_norm > best_norm:
+            best, best_norm = cand, cand_norm
+        else:
+            tokens = word_tokenize(best)
+            if len(tokens) < target_len:
+                tokens = _expand_to_length(tokens, target_len)
+            elif len(tokens) > target_len:
+                tokens = _trim_to_length(tokens, target_len)
+            best = _join_tokens(tokens)
+    return best, best_norm
+
 # ---------------- CLI ----------------
 def main():
     ap = argparse.ArgumentParser(description="AI-content detector: heuristic + supervised + unsupervised (+ TF-IDF/Embeddings/Blend)")
@@ -847,10 +1115,19 @@ def main():
     ap.add_argument("--unsup-max-svm", type=int, default=12000, help="Max rows for OCSVM training (subsample if larger)")
     ap.add_argument("--unsup-max-lof", type=int, default=20000, help="Max rows for LOF training (subsample if larger)")
     ap.add_argument("--unsup-sample-seed", type=int, default=42, help="Random seed for subsampling")
+    # humanize
+    ap.add_argument("--unsup-humanize-file", type=str, help="Rewrite a file using your unsupervised model to maximize human-likeness")
+    ap.add_argument("--unsup-humanize-out", type=str, default="long_para_humanized.txt", help="Output path for --unsup-humanize-file")
+    ap.add_argument("--unsup-humanize-iters", type=int, default=4, help="Max refinement iterations")
+    ap.add_argument("--unsup-keep-connectors", type=int, default=2, help="Max formal connectors to keep")
+    ap.add_argument("--unsup-humanize-strict", action="store_true",
+                    help="Use the stronger unsupervised-guided rewrite (exact-length)")
+    ap.add_argument("--unsup-max-len-cap", action="store_true",
+                    help="Cap rewritten text to original token count (no length growth)")
 
     args = ap.parse_args()
 
-    # supervised train
+    # ---- Branching logic ----
     if args.train:
         train_from_csv(
             args.train,
@@ -872,7 +1149,19 @@ def main():
         )
         return
 
-    # supervised check
+    if args.unsup_train_humans:
+        unsup_train_humans(args.unsup_train_humans,
+                           save_path=args.unsup_model,
+                           model_type=args.unsup_model_type,
+                           outlier_frac=args.unsup_outlier_frac,
+                           threshold_percentile=args.unsup_thr,
+                           dedupe=args.dedupe,
+                           approx_dedupe=args.approx_dedupe,
+                           max_svm=args.unsup_max_svm,
+                           max_lof=args.unsup_max_lof,
+                           sample_seed=args.unsup_sample_seed)
+        return
+
     if args.check is not None or args.check_file:
         text = args.check
         if args.check_file:
@@ -888,8 +1177,6 @@ def main():
         if "model_probability_ai" in res:
             prob = float(res["model_probability_ai"])
             label_default = int(prob >= 0.5)
-
-            # Try to load the pack for the saved threshold
             try:
                 pack = load_model(args.use_model)
                 if args.use_saved_threshold and "operating_threshold" in pack:
@@ -902,7 +1189,6 @@ def main():
             except Exception:
                 print(f"Model prob (AI): {prob:.4f}  |  label@0.50: {label_default}")
 
-            # If channels were provided, show them
             if "channels" in res:
                 ch = res["channels"]
                 print("Channels:", ch)
@@ -915,21 +1201,6 @@ def main():
             print(light_rewrite(text))
         return
 
-    # unsupervised train
-    if args.unsup_train_humans:
-        unsup_train_humans(args.unsup_train_humans,
-                           save_path=args.unsup_model,
-                           model_type=args.unsup_model_type,
-                           outlier_frac=args.unsup_outlier_frac,
-                           threshold_percentile=args.unsup_thr,
-                           dedupe=args.dedupe,
-                           approx_dedupe=args.approx_dedupe,
-                           max_svm=args.unsup_max_svm,
-                           max_lof=args.unsup_max_lof,
-                           sample_seed=args.unsup_sample_seed)
-        return
-
-    # unsupervised check
     if args.unsup_check is not None or args.unsup_check_file:
         text = args.unsup_check
         if args.unsup_check_file:
@@ -946,7 +1217,79 @@ def main():
             print(" -", tip)
         return
 
-    ap.print_help()
+    # unsupervised-guided humanize
+    # ---------------- unsupervised-guided humanize ----------------
+    if args.unsup_humanize_file:
+        if not os.path.exists(args.unsup_humanize_file):
+            print(f"ERROR: file not found: {args.unsup_humanize_file}", file=sys.stderr); sys.exit(1)
+        dump_obj = joblib.load(args.unsup_model)
+        thr = float(dump_obj["threshold"])
+        text = open(args.unsup_humanize_file, "r", encoding="utf-8").read().strip()
+
+        # choose strict or standard humanizer
+        if getattr(args, "unsup_humanize_strict", False):
+            new_text, norm = strict_humanize_with_unsup(
+                text, dump_obj,
+                max_iters=args.unsup_humanize_iters,
+                keep_connectors=args.unsup_keep_connectors
+            )
+        else:
+            new_text, norm = humanize_with_unsup(
+                text, dump_obj,
+                max_iters=args.unsup_humanize_iters,
+                keep_connectors=args.unsup_keep_connectors
+            )
+
+        # hard guarantee: exact word count match to the original (no dynamic setup)
+        orig_len = len(word_tokenize(text))
+        new_tokens = word_tokenize(new_text)
+        if len(new_tokens) != orig_len:
+            if len(new_tokens) < orig_len:
+                new_tokens = _expand_to_length(new_tokens, orig_len)
+            else:
+                new_tokens = _trim_to_length(new_tokens, orig_len)
+            new_text = _join_tokens(new_tokens)
+
+        with open(args.unsup_humanize_out, "w", encoding="utf-8") as f:
+            f.write(new_text)
+        label = int(norm < thr)
+        print(f"Saved → {args.unsup_humanize_out}")
+        print(f"Final normality={norm:.4f} | threshold={thr:.4f} | anomaly={label} (1=AI-like, 0=human-like)")
+        return
+
+
+# ---------------- Tips & Light Rewrite (legacy unsup-guided) ----------------
+def humanize_with_unsup(text: str, dump_obj: dict, max_iters=4, keep_connectors=2) -> Tuple[str, float]:
+    # preserves earlier behaviour; kept for compatibility
+    import numpy as np
+    def norm_score(t: str) -> float:
+        feats = score_features(t)
+        vec = np.array([[float(feats.get(f, 0.0)) for f in dump_obj["feature_order"]]], dtype=float)
+        mu, sigma = dump_obj["mu"], dump_obj["sigma"]
+        xz = (vec - mu) / sigma
+        return _unsup_normality_score(xz, dump_obj)
+
+    best = text
+    best_norm = norm_score(best)
+    cand = light_rewrite(best)
+    cand = _soften_connectors_simple(cand, keep=keep_connectors)
+    if ":" not in cand and "(" not in cand and ")" not in cand:
+        cand = re.sub(r",\s+", ": ", cand, count=1)
+    cand_norm = norm_score(cand)
+    if cand_norm > best_norm:
+        best, best_norm = cand, cand_norm
+
+    for _ in range(max_iters-1):
+        cand = light_rewrite(best)
+        cand = _soften_connectors_simple(cand, keep=keep_connectors)
+        cand = re.sub(r"\s+([,.!?;:])", r"\1", cand).strip()
+        cand_norm = norm_score(cand)
+        if cand_norm > best_norm:
+            best, best_norm = cand, cand_norm
+        else:
+            break
+    return best, best_norm
+
 
 if __name__ == "__main__":
     main()
